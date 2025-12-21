@@ -45,7 +45,7 @@ class LoraTrainingMonitorCallback(TrainerCallback):
 # 内存优化的collate_fn
 def collate_fn(
     batch,
-    smiles_len=6,           # 4 smiles + 2 special tokens
+    smiles_len=10*5,           # 4 smiles + 2 special tokens
     pad_token_id=0,
     label_pad_id=-100,
 ):
@@ -78,13 +78,13 @@ def collate_fn(
         "input_ids": torch.tensor(input_ids, dtype=torch.long),
         "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
         "labels": torch.tensor(labels, dtype=torch.long),
-        "smiles": [x["smiles"].replace(".", "") for x in batch],
+        "smiles": [[x["smiles"].replace(".", "")] for x in batch],
     }
 
 
 # LoRA SFT训练函数
 def train_sft_lora(
-    model_name="/zengdaojian/zhangjia/BioLatent/Qwen4B",
+    model_name="/zengdaojian/zhangjia/BioLatent/Qwen8B",
     data_path="/zengdaojian/zhangjia/BioLatent/ChemCotDataset/chemcotbench-cot",
     output_dir="./qwen3_mol_sft_lora_results",
     epochs=3,
@@ -309,7 +309,7 @@ def train_sft_lora(
 
 # 加载LoRA模型进行推理 - 修复设备问题
 def load_lora_model_for_inference(
-    base_model_path="/zengdaojian/zhangjia/BioLatent/Qwen4B",
+    base_model_path="/zengdaojian/zhangjia/BioLatent/Qwen8B",
     lora_weights_path="./qwen3_mol_sft_lora_results/lora_weights",
     projector_path="./qwen3_mol_sft_lora_results/projector.pt",
     merge_lora=True,
@@ -374,7 +374,7 @@ def load_lora_model_for_inference(
 def test_lora_inference(
     model,
     tokenizer,
-    test_smiles=["CC1[NH2+]CCC1C(=O)Nc1cc(C(N)=O)ccc1Cl"],
+    test_smiles=[["CC1[NH2+]CCC1C(=O)Nc1cc(C(N)=O)ccc1Cl"]],
     test_prompts=["Modify the molecule CC1[NH2+]CCC1C(=O)Nc1cc(C(N)=O)ccc1Cl by adding a carboxyl."],
     max_new_tokens=200,
     temperature=0.7,
@@ -393,8 +393,9 @@ def test_lora_inference(
     results = []
     
     for smiles, prompt in zip(test_smiles, test_prompts):
+        print(smiles)
         # 清理SMILES
-        cleaned_smiles = smiles.replace(".", "").strip()
+        cleaned_smiles = [smile.replace(".", "").strip() for smile in smiles]
         
         logger.info(f"\n{'='*50}")
         logger.info(f"Input SMILES: {cleaned_smiles}")
@@ -499,7 +500,7 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(description="LoRA微调多模态分子-语言模型")
     parser.add_argument("--mode", type=str, choices=["train", "inference"], default="train", help="运行模式")
-    parser.add_argument("--model_path", type=str, default="./qwen3_mol_sft_lora_results", help="模型路径")
+    parser.add_argument("--model_path", type=str, default="./qwen3_8B_without_rnx_mol_sft_lora_results", help="模型路径")
     parser.add_argument("--data_path", type=str, default="/zengdaojian/zhangjia/BioLatent/ChemCotDataset/chemcotbench-cot", help="数据路径")
     parser.add_argument("--batch_size", type=int, default=2, help="批次大小")
     parser.add_argument("--max_seq_length", type=int, default=512, help="最大序列长度")
@@ -522,7 +523,7 @@ if __name__ == "__main__":
         test_lora_inference(
             trained_model,
             trained_model.tokenizer,
-            test_smiles=["CC(=O)OC1=CC=CC=C1C(=O)O"],
+            test_smiles=[["CC(=O)OC1=CC=CC=C1C(=O)O"]],
             test_prompts=["Please describe the functional groups of this molecule."]
         )
     
@@ -537,6 +538,6 @@ if __name__ == "__main__":
         test_lora_inference(
             model,
             tokenizer,
-            test_smiles=["CC1[NH2+]CCC1C(=O)Nc1cc(C(N)=O)ccc1Cl"],
+            test_smiles=[["CC(=O)OC1=CC=CC=C1C(=O)O"]],
             test_prompts=["Modify the molecule CC1[NH2+]CCC1C(=O)Nc1cc(C(N)=O)ccc1Cl by adding a carboxyl."]
         )

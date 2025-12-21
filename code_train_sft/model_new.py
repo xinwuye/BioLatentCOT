@@ -4,7 +4,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, P
 from transformers.modeling_outputs import CausalLMOutputWithPast
 import sys
 sys.path.append('/zengdaojian/zhangjia/BioLatent/smi-ted/smi-ted/inference')
-from smi_ted_light.load import load_smi_ted
+from smi_ted_light.loadnew import load_smi_ted
 import torch.nn.functional as F
 from transformers.generation.utils import GenerationConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
@@ -18,12 +18,14 @@ from typing import List, Optional
 # 1. 投影器：将分子特征映射到LLM空间
 # ============================
 class QueryAttentionProjector(nn.Module):
-    def __init__(self, input_dim=768, num_queries=4, output_dim=2560, num_heads=8):
+    def __init__(self, input_dim=768, num_queries=8, output_dim=4096, num_heads=8):
         """
         简化版本的查询注意力投影器（包含必要的归一化）
+        修改：支持处理5维分子特征 [B, num_molecules, 1, L_mol, input_dim]
         """
         super().__init__()
         self.num_queries = num_queries
+        self.output_dim = output_dim
         
         # 输入归一化
         self.input_norm = nn.LayerNorm(input_dim)
@@ -61,13 +63,25 @@ class QueryAttentionProjector(nn.Module):
             nn.init.zeros_(self.proj.bias)
     
     def forward(self, x):
-        B = x.size(0)
+        """
+        前向传播，处理5维分子特征
+        x: [B, num_molecules, 1, L_mol, input_dim]
+        return: [B, num_molecules, num_queries, output_dim]
+        """
+        B, num_molecules, _, L_mol, d_input = x.shape
+        
+        # 重塑为 [B * num_molecules, L_mol, d_input] 用于批量处理
+        # 首先压缩第2维（1维）
+        x_squeezed = x.squeeze(2)  # [B, num_molecules, L_mol, d_input]
+        
+        # 然后重塑为 [B * num_molecules, L_mol, d_input]
+        x_reshaped = x_squeezed.reshape(B * num_molecules, L_mol, d_input)
         
         # 输入归一化
-        x_norm = self.input_norm(x)
+        x_norm = self.input_norm(x_reshaped)
         
         # 准备查询向量
-        q = self.query.expand(B, -1, -1)
+        q = self.query.expand(B * num_molecules, -1, -1)
         q = self.query_norm(q)
         
         # 注意力计算
@@ -82,6 +96,9 @@ class QueryAttentionProjector(nn.Module):
         
         # 最终投影
         out = self.proj(proj_input)
+        
+        # 重塑回原始形状 [B, num_molecules, num_queries, output_dim]
+        out = out.reshape(B, num_molecules, self.num_queries, self.output_dim)
         
         return out
 
@@ -127,6 +144,7 @@ class Qwen3MoleculeLLM(PreTrainedModel):
 
         # 获取LLM的嵌入维度
         self.d_llm = self.model.get_input_embeddings().weight.shape[1]
+        print(f"LLM嵌入维度: {self.d_llm}")
 
         # ---- 2. 分子编码器和投影器 ----
         # 加载预训练的分子编码器（SMI-TED）
@@ -172,32 +190,79 @@ class Qwen3MoleculeLLM(PreTrainedModel):
         # ============================
         with torch.no_grad():  # 冻结分子编码器，不计算梯度
             # 编码SMILES字符串为分子特征
+            # 编码器输出形状为 [B, num_molecules, 1, L_mol, d_mol]
             mol_emb = self.mol_encoder.encode(
                 smiles_list, return_torch=True
-            ).to(device)  # [B, L_mol, d_mol]
+            ).to(device)  # [B, num_molecules, 1, L_mol, d_mol]
+            
+            print(f"分子编码器输出形状: {mol_emb.shape}")
 
         # 将分子特征投影到LLM嵌入空间
-        mol_emb_llm = self.projector(mol_emb)  # [B, num_queries, d_llm]
-
+        mol_emb_llm = self.projector(mol_emb)  # [B, num_molecules, num_queries, d_llm]
+        print(f"投影后分子特征形状: {mol_emb_llm.shape}")
+        print(f"投影器输出维度: {mol_emb_llm.size(-1)}")
+        print(f"LLM嵌入维度: {self.d_llm}")
+        
         # 获取LLM的嵌入层
         embed = self.model.get_input_embeddings()
         
-        # 创建分子开始标记的嵌入
-        start_emb = embed(
-            torch.tensor([self.start_id], device=device)
-        ).expand(B, 1, -1)  # [B, 1, d_llm]
+        # ============================
+        # 3. 为每个分子添加开始和结束标记
+        # ============================
+        # 正确获取开始和结束标记的嵌入向量
+        # 使用 token id 直接获取嵌入，确保形状正确
+        with torch.no_grad():
+            # 正确创建 token tensors
+            start_token_tensor = torch.tensor([[self.start_id]], device=device)
+            end_token_tensor = torch.tensor([[self.end_id]], device=device)
+            
+            # 获取嵌入向量
+            start_emb = embed(start_token_tensor)  # [1, 1, d_llm]
+            end_emb = embed(end_token_tensor)      # [1, 1, d_llm]
         
-        # 创建分子结束标记的嵌入
-        end_emb = embed(
-            torch.tensor([self.end_id], device=device)
-        ).expand(B, 1, -1)  # [B, 1, d_llm]
-
-        # 拼接分子前缀：<mol_start> + 分子特征 + <mol_end>
-        mol_prefix = torch.cat([start_emb, mol_emb_llm, end_emb], dim=1)
-        L_mol = mol_prefix.size(1)  # 分子前缀的长度
+        print(f"开始标记嵌入形状: {start_emb.shape}")
+        print(f"结束标记嵌入形状: {end_emb.shape}")
+        
+        # 为每个样本中的每个分子添加开始和结束标记
+        mol_prefix_list = []
+        for b in range(B):
+            sample_molecules = []
+            num_molecules = mol_emb_llm.size(1)  # 每个样本的分子数量
+            
+            for m in range(num_molecules):
+                # 获取当前分子的特征 [num_queries, d_llm]
+                molecule_feat = mol_emb_llm[b, m]  # [num_queries, d_llm]
+                
+                # 检查维度是否匹配
+                if molecule_feat.size(-1) != start_emb.size(-1):
+                    raise ValueError(f"分子特征维度 {molecule_feat.size(-1)} 与开始标记维度 {start_emb.size(-1)} 不匹配")
+                
+                # 添加开始和结束标记
+                molecule_with_tags = torch.cat([
+                    start_emb,  # [1, 1, d_llm]
+                    molecule_feat.unsqueeze(0),  # [1, num_queries, d_llm]
+                    end_emb     # [1, 1, d_llm]
+                ], dim=1)  # [1, num_queries+2, d_llm]
+                
+                sample_molecules.append(molecule_with_tags)
+            
+            # 拼接当前样本中的所有分子
+            if sample_molecules:
+                sample_prefix = torch.cat(sample_molecules, dim=1)  # [1, total_mol_tokens, d_llm]
+                mol_prefix_list.append(sample_prefix)
+            else:
+                # 如果没有分子，创建空的分子前缀
+                empty_prefix = torch.zeros(1, 0, self.d_llm, device=device)
+                mol_prefix_list.append(empty_prefix)
+        
+        # 将所有样本的分子前缀拼接
+        mol_prefix = torch.cat(mol_prefix_list, dim=0)  # [B, total_mol_tokens, d_llm]
+        L_mol = mol_prefix.size(1)  # 分子前缀的总长度
+        
+        print(f"分子前缀形状: {mol_prefix.shape}")
 
         # ============================
-        # 3. 文本嵌入
+        # 4. 文本嵌入
         # ============================
         if inputs_embeds is None:
             # 如果未提供嵌入，通过token IDs计算
@@ -206,13 +271,17 @@ class Qwen3MoleculeLLM(PreTrainedModel):
             # 使用提供的嵌入
             text_emb = inputs_embeds
 
-        # ============================
-        # 4. 融合分子和文本嵌入
-        # ============================
-        fused_embeds = torch.cat([mol_prefix, text_emb], dim=1).to(self.model.dtype)
+        print(f"文本嵌入形状: {text_emb.shape}")
 
         # ============================
-        # 5. 注意力掩码处理
+        # 5. 融合分子和文本嵌入
+        # ============================
+        fused_embeds = torch.cat([mol_prefix, text_emb], dim=1).to(self.model.dtype)
+        
+        print(f"融合嵌入形状: {fused_embeds.shape}")
+
+        # ============================
+        # 6. 注意力掩码处理
         # ============================
         if attention_mask is not None:
             # 为分子部分创建全1的掩码
@@ -223,7 +292,7 @@ class Qwen3MoleculeLLM(PreTrainedModel):
             fused_attention_mask = None
 
         # ============================
-        # 6. 位置ID处理
+        # 7. 位置ID处理
         # ============================
         if position_ids is not None:
             # 为分子部分创建连续位置ID
@@ -234,7 +303,7 @@ class Qwen3MoleculeLLM(PreTrainedModel):
             fused_position_ids = None
 
         # ============================
-        # 7. 调用Qwen基础模型
+        # 8. 调用Qwen基础模型
         # ============================
         outputs = self.model(
             inputs_embeds=fused_embeds,           # 融合后的嵌入
@@ -251,7 +320,7 @@ class Qwen3MoleculeLLM(PreTrainedModel):
         logits = outputs.logits  # [B, T, vocab_size]
 
         # ============================
-        # 8. 计算损失（训练时使用）
+        # 9. 计算损失（训练时使用）
         # ============================
         loss = None
         if labels is not None:
@@ -272,7 +341,7 @@ class Qwen3MoleculeLLM(PreTrainedModel):
             )
 
         # ============================
-        # 9. 返回输出
+        # 10. 返回输出
         # ============================
         return CausalLMOutputWithPast(
             loss=loss,                        # 损失值（训练时）
@@ -281,65 +350,6 @@ class Qwen3MoleculeLLM(PreTrainedModel):
             hidden_states=outputs.hidden_states,      # 隐藏状态
             attentions=outputs.attentions,            # 注意力权重
         )
-
-# 在 model_new.py 的 Qwen3MoleculeLLM 类中添加
-
-
-    # def generate(
-    #     self,
-    #     smiles_list: list[str],
-    #     input_ids: torch.Tensor,  # tokenized prompt (B, prompt_len)
-    #     max_new_tokens: int = 200,
-    #     temperature: float = 0.7,
-    #     top_p: float = 0.9,
-    #     do_sample: bool = True,
-    #     **kwargs
-    # ) -> torch.Tensor:
-    #     self.eval()
-    #     batch_size = input_ids.size(0)
-    #     device = input_ids.device
-
-    #     # Project SMILES to queries (assume projector returns (B, num_queries, dim))
-    #     queries = self.projector(smiles_list).to(device)  # 需确认projector支持list
-
-    #     # 初始化 generated_ids = input_ids
-    #     generated_ids = input_ids.clone()
-
-    #     # 假设 LLM 是 CausalLM，需逐步生成
-    #     # 注意：queries作为prefix，类似past_key_values，但需自定义loop因为queries是fixed
-    #     for _ in range(max_new_tokens):
-    #         # Forward: 获取当前logits (queries + generated_ids)
-    #         with torch.no_grad():
-    #             logits = self.forward(smiles_list, generated_ids)  # 复用原有forward
-
-    #         # 取最后一个token的logits (B, 1, vocab)
-    #         next_logits = logits[:, -1, :]
-
-    #         # Sampling
-    #         if do_sample:
-    #             next_logits = next_logits / temperature
-    #             probs = torch.softmax(next_logits, dim=-1)
-    #             # top_p nucleus sampling
-    #             sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
-    #             cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-    #             mask = cumulative_probs > top_p
-    #             mask[..., 0] = False  # 至少保持top1
-    #             sorted_probs[mask] = 0
-    #             probs = sorted_probs / sorted_probs.sum(dim=-1, keepdim=True)
-    #             next_token = torch.gather(sorted_indices, -1, torch.multinomial(probs, num_samples=1))
-    #         else:
-    #             next_token = next_logits.argmax(dim=-1, keepdim=True)
-
-    #         # Append
-    #         generated_ids = torch.cat([generated_ids, next_token], dim=-1)
-
-    #         # Early stop if all EOS
-    #         if torch.all(next_token == self.tokenizer.eos_token_id):
-    #             break
-
-    #     return generated_ids
-
-
 
     @torch.no_grad()
     def generate(
@@ -353,14 +363,13 @@ class Qwen3MoleculeLLM(PreTrainedModel):
         do_sample: bool = True,
     ):
         """
-        稳定版 generate（支持 molecule prefix + Qwen）
+        生成方法，支持处理多个分子的特征
         """
-
         device = input_ids.device
         B = input_ids.size(0)
 
         # =========================================================
-        # 0. tokenizer 安全兜底（只需一次，但多做一次不出错）
+        # 0. tokenizer 安全兜底
         # =========================================================
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -369,38 +378,77 @@ class Qwen3MoleculeLLM(PreTrainedModel):
         # 1. 文本 embedding
         # =========================================================
         text_embeds = self.model.get_input_embeddings()(input_ids)
-        # shape: [B, L_text, hidden]
+        # shape: [B, L_text, d_llm]
 
         L_text = text_embeds.size(1)
 
         # =========================================================
-        # 2. 分子 query prefix（必须是 Tensor！）
+        # 2. 分子编码和投影
         # =========================================================
-        # projector 输入必须是 tensor / batch tensor
-        # 这里假设 projector 已经内部处理 SMILES → embedding
-        with torch.no_grad():  # 冻结分子编码器，不计算梯度
-    # 编码SMILES字符串为分子特征
+        with torch.no_grad():
+            # 编码SMILES字符串为分子特征
             mol_emb = self.mol_encoder.encode(
                 smiles_list, return_torch=True
-            ).to(device)  # [B, L_mol, d_mol]
-        mol_embeds = self.projector(mol_emb)
-        mol_embeds = mol_embeds.to(device)
-
-        # 确保 batch 对齐
-        assert mol_embeds.size(0) == B, "Batch size mismatch"
-
-        L_mol = mol_embeds.size(1)
-
+            ).to(device)  # [B, num_molecules, 1, L_mol, d_mol]
+            
+            # 投影到LLM空间
+            mol_embeds = self.projector(mol_emb)  # [B, num_molecules, num_queries, d_llm]
+        
         # =========================================================
-        # 3. 拼接 inputs_embeds
+        # 3. 为每个分子添加开始和结束标记
         # =========================================================
-        inputs_embeds = torch.cat([mol_embeds, text_embeds], dim=1)
-        # shape: [B, L_mol + L_text, hidden]
+        embed = self.model.get_input_embeddings()
+        
+        # 正确获取开始和结束标记的嵌入向量
+        with torch.no_grad():
+            start_token_tensor = torch.tensor([[self.start_id]], device=device)
+            end_token_tensor = torch.tensor([[self.end_id]], device=device)
+            
+            start_emb = embed(start_token_tensor)  # [1, 1, d_llm]
+            end_emb = embed(end_token_tensor)      # [1, 1, d_llm]
+        
+        # 为每个样本中的每个分子添加开始和结束标记
+        mol_prefix_list = []
+        for b in range(B):
+            sample_molecules = []
+            num_molecules = mol_embeds.size(1)  # 每个样本的分子数量
+            
+            for m in range(num_molecules):
+                # 获取当前分子的特征 [num_queries, d_llm]
+                molecule_feat = mol_embeds[b, m]  # [num_queries, d_llm]
+                
+                # 添加开始和结束标记
+                molecule_with_tags = torch.cat([
+                    start_emb,
+                    molecule_feat.unsqueeze(0),
+                    end_emb
+                ], dim=1)  # [1, num_queries+2, d_llm]
+                
+                sample_molecules.append(molecule_with_tags)
+            
+            # 拼接当前样本中的所有分子
+            if sample_molecules:
+                sample_prefix = torch.cat(sample_molecules, dim=1)  # [1, total_mol_tokens, d_llm]
+                mol_prefix_list.append(sample_prefix)
+            else:
+                # 如果没有分子，创建空的分子前缀
+                empty_prefix = torch.zeros(1, 0, self.d_llm, device=device)
+                mol_prefix_list.append(empty_prefix)
+        
+        # 将所有样本的分子前缀拼接
+        mol_prefix = torch.cat(mol_prefix_list, dim=0)  # [B, total_mol_tokens, d_llm]
+        L_mol = mol_prefix.size(1)
+        
+        # =========================================================
+        # 4. 拼接 inputs_embeds
+        # =========================================================
+        inputs_embeds = torch.cat([mol_prefix, text_embeds], dim=1)
+        # shape: [B, L_mol + L_text, d_llm]
 
         total_len = inputs_embeds.size(1)
 
         # =========================================================
-        # 4. attention_mask（必须和 inputs_embeds 对齐）
+        # 5. attention_mask处理
         # =========================================================
         if attention_mask is None:
             text_mask = torch.ones(B, L_text, device=device)
@@ -411,7 +459,7 @@ class Qwen3MoleculeLLM(PreTrainedModel):
         fused_attention_mask = torch.cat([mol_mask, text_mask], dim=1).long()
 
         # =========================================================
-        # 5. position_ids（❗关键❗inputs_embeds 必须显式给）
+        # 6. position_ids处理
         # =========================================================
         position_ids = torch.arange(
             total_len,
@@ -419,12 +467,12 @@ class Qwen3MoleculeLLM(PreTrainedModel):
         ).unsqueeze(0).expand(B, -1)
 
         # =========================================================
-        # 6. 最稳妥的 generate 调用
+        # 7. 生成调用
         # =========================================================
         outputs = self.model.generate(
             inputs_embeds=inputs_embeds,
             attention_mask=fused_attention_mask,
-            position_ids=position_ids,              # ⭐ 必须
+            position_ids=position_ids,
             max_new_tokens=max_new_tokens,
             do_sample=do_sample,
             temperature=temperature if do_sample else None,
@@ -435,7 +483,6 @@ class Qwen3MoleculeLLM(PreTrainedModel):
         )
 
         return outputs
-
 
 
 # ============================
@@ -452,7 +499,7 @@ if __name__ == "__main__":
     # 示例文本
     texts = [
         "Please describe the functional groups of this molecule.",
-        "Please describe the functional groups of this molecule  123  yes"
+        "Please describe the functional groups of this molecule."
     ]
     
     # 文本编码
@@ -460,16 +507,16 @@ if __name__ == "__main__":
     input_ids = enc["input_ids"].cuda()
     attention_mask = enc["attention_mask"].cuda()
 
-    # 示例SMILES
+    # 示例SMILES列表（每个样本包含3个分子）
     smiles_list = [
-        "CC(=O)OC1=CC=CC=C1C(=O)O",  # 阿司匹林
-        "CC(=O)OC1=CC=CC=C1C(=O)O"
+        ["CC(=O)OC1=CC=CC=C1C(=O)O", "CC(C)CC1=CC=C(C=C1)C(C)C(=O)O", "C1=CC=C(C=C1)C=O"],  # 样本1的3个分子
+        ["CC(=O)OC1=CC=CC=C1C(=O)O", "C1=CC=C(C=C1)C=O"]   # 样本2的3个分子
     ]
     
     # 示例标签（实际训练时会来自数据集）
-    Labels = [
-        "CC(=O)OC1=CC=CC=C1C(=O)O",
-        "CC(=O)OC1=CC=CC=C1C(=O)O"
+    labels = [
+        "This molecule contains carboxylic acid and ester functional groups.",
+        "This molecule contains carboxylic acid and ester functional groups."
     ]
 
     # 前向传播
